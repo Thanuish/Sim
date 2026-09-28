@@ -1,0 +1,41 @@
+# docker compose up            -> CPU-only (works on any PC)
+# docker compose up teleop-gpu -> NVIDIA GPU renders the camera screens (needs the NVIDIA
+#                                 Container Toolkit; physics runs on the CPU either way)
+#
+# The Quest connects to http://localhost:8080 over USB (adb reverse tcp:8080 tcp:8080 on the PC),
+# or over Wi-Fi to https://<PC-IP>:8443 after setting TELEOP_PUBLIC_HOST (see README).
+x-teleop: &teleop
+  build: .
+  image: mujoco-vr-teleop
+  init: true
+  ports:
+    - "8080:8080"
+    - "8443:8443"
+  volumes:
+    - ./data:/app/data        # recorded episodes stay on the PC
+    - ./certs:/app/certs      # HTTPS certificate is kept between runs
+  environment:
+    TELEOP_PUBLIC_HOST: ${TELEOP_PUBLIC_HOST:-}
+    USER: ${USER:-${USERNAME:-operator}}
+  command: ${TELEOP_ARGS:---http}
+
+services:
+  teleop:
+    <<: *teleop
+
+  teleop-gpu:
+    <<: *teleop
+    profiles: [gpu]
+    environment:
+      TELEOP_PUBLIC_HOST: ${TELEOP_PUBLIC_HOST:-}
+      USER: ${USER:-${USERNAME:-operator}}
+      MUJOCO_GL: egl
+      PYOPENGL_PLATFORM: egl
+      NVIDIA_DRIVER_CAPABILITIES: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

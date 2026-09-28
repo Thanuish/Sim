@@ -1,0 +1,9 @@
+.venv
+data
+certs
+assets/generated
+**/__pycache__
+*.pyc
+*.mp4
+MUJOCO_LOG.TXT
+.git

@@ -1,0 +1,8 @@
+# Versions tested together (the cloth task needs MuJoCo 3.14: discrete integrator, flex features)
+mujoco==3.14.0
+numpy>=2.0,<3
+aiohttp>=3.9,<4
+h5py>=3.10
+cryptography>=42
+imageio[ffmpeg]>=2.34
+Pillow>=10
