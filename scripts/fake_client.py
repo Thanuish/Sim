@@ -27,6 +27,19 @@ TABLE_Z = 0.75
 CTRL_BASE = {"left": np.array([0.0, 0.25, 1.1]), "right": np.array([0.0, -0.25, 1.1])}
 
 
+class Pacer:
+    """Sends at a fixed rate against absolute deadlines. A plain asyncio.sleep(1/72) can return up
+    to ~16 ms early on Windows (Python 3.12's 15.6 ms monotonic clock), which made the scripted
+    moves run several times too fast and flooded the server with input."""
+    def __init__(self, hz: float):
+        self.dt = 1.0 / hz
+        self.next = time.perf_counter()
+
+    async def wait(self):
+        self.next += self.dt
+        await asyncio.sleep(max(0.0, self.next - time.perf_counter()))
+
+
 class Client:
     def __init__(self, ws):
         self.ws = ws
@@ -61,6 +74,7 @@ class Client:
 async def circles(cl: Client, seconds: float):
     await cl.cmd("record_toggle")
     t0 = time.time()
+    pace = Pacer(72)
     while (t := time.time() - t0) < seconds:
         off = {}
         for side, sgn in (("left", 1), ("right", -1)):
@@ -68,7 +82,7 @@ async def circles(cl: Client, seconds: float):
             off[side] = np.array([r * math.cos(2 * t), sgn * r * math.sin(2 * t), -0.1 * min(t, 1.0)])
         st = 1.0 if t < seconds / 2 else -1.0
         await cl.send(off, t > 0.2, {"left": st, "right": st})
-        await asyncio.sleep(1 / 72)
+        await pace.wait()
 
 
 async def fold(cl: Client):
@@ -88,6 +102,7 @@ async def fold(cl: Client):
     async def move(goal, dur, close=None):
         start = {s: target[s].copy() for s in HOME}
         n = max(1, int(dur * 72))
+        pace = Pacer(72)
         for k in range(n):
             a = 0.5 - 0.5 * math.cos(math.pi * (k + 1) / n)
             stick = {}
@@ -97,7 +112,7 @@ async def fold(cl: Client):
                 c = (close or {}).get(s)
                 stick[s] = 0.0 if c is None else (1.0 if c else -1.0)   # +y (down) closes
             await cl.send({s: target[s] - HOME[s] for s in HOME}, True, stick)
-            await asyncio.sleep(1 / 72)
+            await pace.wait()
 
     def report(label):
         s = cl.status

@@ -22,6 +22,7 @@ import mujoco
 import numpy as np
 
 from . import cloth as C
+from . import cloth_config as CC
 from . import textures as T
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +88,7 @@ class SceneInfo:
     task: str = DEFAULT_TASK
     objects: dict = field(default_factory=dict)         # rigid task objects (name -> spec tuple)
     cloth: C.ClothInfo | None = None
+    cloth_config: CC.ClothConfig | None = None           # garment + cloth simulation settings
     grasp_eq: dict = field(default_factory=dict)        # side -> [eq ids] (cloth pinch)
     web_textures: dict = field(default_factory=dict)    # extra textures for the web client
     arm_qpos_adr: dict = field(default_factory=dict)   # side -> (6,) qpos indices
@@ -230,8 +232,8 @@ def _add_blocks(spec: mujoco.MjSpec):
         g.condim = 4
 
 
-def _add_jeans(spec: mujoco.MjSpec, garment: C.GarmentSpec | None = None):
-    g = garment or C.GarmentSpec()
+def _add_jeans(spec: mujoco.MjSpec, cfg: CC.ClothConfig):
+    g = cfg.garment
     front, back = C.denim_textures(g)
     # texture atlas: front panel on the left half, back panel on the right half
     atlas = np.concatenate([T.decode_png(front), T.decode_png(back)], axis=1)
@@ -240,35 +242,48 @@ def _add_jeans(spec: mujoco.MjSpec, garment: C.GarmentSpec | None = None):
     x, y = JEANS_POS
     info = C.add_garment(spec, "jeans", [x, y, TABLE_Z + g.sphere_r + 0.0003], JEANS_YAW, g,
                          material="denim")
-    # Silicone finger pads (mu ~ 1 on fabric) that also touch the continuous cloth surface
+    # Every collision geom of the grippers (pads, finger links, palm) touches the continuous cloth
+    # surface, not only the vertex spheres: those are 5 cm apart, and a finger moved sideways
+    # would slip between them, through the fabric, and the jeans would hang on it.
+    # Silicone finger pads: mu ~ 1 on fabric (grasp.pad_friction).
     for b in spec.bodies:
+        if "_gripper_" not in b.name:
+            continue
         for gm in b.geoms:
-            if gm.name.endswith(("_pad1", "_pad2")):
+            if gm.contype or gm.conaffinity:
                 gm.conaffinity = gm.conaffinity | C.FLEX_CONTYPE
-                gm.friction = [1.0, 0.01, 0.001]
+            if gm.name.endswith(("_pad1", "_pad2")):
+                gm.friction = [cfg.pad_friction, 0.01, 0.001]
     for side in SIDES:
         C.add_grasp_constraints(spec, info, side)
     return info, {}
 
 
-def build_spec(task: str = DEFAULT_TASK, cloth_spacing: float | None = None):
-    """Returns (spec, cloth_info or None, extra web textures)."""
+def build_spec(task: str = DEFAULT_TASK, cloth: CC.ClothConfig | None = None):
+    """Returns (spec, cloth_info or None, extra web textures). `cloth`: garment and cloth
+    simulation settings (default: config/cloth.toml, see cloth_config)."""
     if task not in TASKS:
         raise ValueError(f"unknown task '{task}', choose from {list(TASKS)}")
     spec = mujoco.MjSpec()
     spec.modelname = f"dual_ur5e_{task}"
     spec.option.timestep = 0.002
     if task == "jeans":
+        cloth = cloth or CC.load()
         # flex bending elasticity is integrated implicitly only by the discrete integrator;
         # pyramidal cones keep the ~300 cloth contacts cheap enough for real time
         spec.option.integrator = mujoco.mjtIntegrator.mjINT_DISCRETE
         spec.option.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
-        spec.option.timestep = 0.003    # keeps the cloth real time while it is lifted and carried
+        # Timestep (config: simulation.timestep, 4 ms): pays for the full cloth collision model
+        # at the quality of 3 ms, also for a crumpled heap; 5 ms degrades a heap, 6 ms is unstable.
+        spec.option.timestep = cloth.timestep
         # Conjugate-gradient solver with a fixed iteration budget: the two-layer garment makes
-        # Newton's matrix factorisation ~2x too slow; CG keeps thread stretch < 1 % and a flat
-        # per-step cost (no frame-time spikes in VR).
+        # Newton's matrix factorisation ~1.6x slower; CG keeps a flat per-step cost (no
+        # frame-time spikes in VR). The budget (simulation.solver_iterations, 30) matters: at 24
+        # CG stops short while a leg hangs from the grippers and the threads stretch up to ~17 %
+        # (rubbery jeans); 30 keeps them at < 1.2 % for 99 % of the edges.
+        # (scripts/cloth_bench.py measures this.)
         spec.option.solver = mujoco.mjtSolver.mjSOL_CG
-        spec.option.iterations = 24
+        spec.option.iterations = cloth.solver_iterations
         spec.option.tolerance = 1e-6
     else:
         spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
@@ -343,8 +358,7 @@ def build_spec(task: str = DEFAULT_TASK, cloth_spacing: float | None = None):
     if task == "blocks":
         _add_blocks(spec)
     elif task == "jeans":
-        g = C.GarmentSpec(spacing=cloth_spacing) if cloth_spacing else None
-        cloth_info, web_tex = _add_jeans(spec, g)
+        cloth_info, web_tex = _add_jeans(spec, cloth)
     return spec, cloth_info, web_tex
 
 
@@ -366,10 +380,13 @@ def _look_quat(pos, target, up=(0, 0, 1)):
     return q
 
 
-def build_scene(task: str = DEFAULT_TASK, cloth_spacing: float | None = None) -> SceneInfo:
-    spec, cloth_info, web_tex = build_spec(task, cloth_spacing)
+def build_scene(task: str = DEFAULT_TASK, cloth: CC.ClothConfig | None = None) -> SceneInfo:
+    if task == "jeans":
+        cloth = cloth or CC.load()
+    spec, cloth_info, web_tex = build_spec(task, cloth)
     model = spec.compile()
-    info = SceneInfo(model=model, xml=spec.to_xml(), task=task, web_textures=web_tex)
+    info = SceneInfo(model=model, xml=spec.to_xml(), task=task, web_textures=web_tex,
+                     cloth_config=cloth)
     for side in SIDES:
         jids = [model.joint(f"{side}_{j}").id for j in ARM_JOINTS]
         info.arm_qpos_adr[side] = np.array([model.jnt_qposadr[j] for j in jids])

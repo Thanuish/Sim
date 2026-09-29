@@ -31,25 +31,33 @@ jeans: a **front and a back panel sewn together** along the outer leg seams and 
 panel shows the fly, front pockets, coin pocket and rivets; the back panel the yoke, back pockets
 and leather patch; the inside is the pale reverse side of the denim. Physics:
 
-- threads along and across the legs barely stretch (under 1 %); the fabric shears easily on the
+- threads along and across the legs barely stretch (about 1 %, a few % at most while a leg hangs
+  from the grippers); the fabric shears easily on the
   bias, so it drapes and folds; denim bending stiffness; air drag on falling fabric;
 - friction against the laminate table (μ≈0.4) and the silicone finger pads (μ≈1.0);
-- the two panels can't pass through each other or through folded layers (contact spheres on
-  the front panel against the continuous surface of the back panel, plus sphere-sphere contact);
-  fabric sliding on fabric is frictionless (`self_condim` in `GarmentSpec` turns friction on at
-  ~20 % more cost).
+- the fabric never passes through itself: not the two panels, not a leg folded over the other,
+  not a crumpled heap (a contact sphere at every vertex touches the continuous surface of both
+  panels, and the surface also collides with itself triangle against triangle). The whole
+  gripper (fingers and palm, not only the pads) touches that surface, so a finger can't slip
+  through the fabric and snag it. Fabric sliding on fabric is frictionless (`self_condim` in
+  `GarmentSpec` turns friction on at ~20 % more cost).
 
-The simulation resolution is 5.5 cm (`--cloth-spacing`, about 280 vertices). On the development
-Mac it runs at about real time, and 0.7-0.9x during the heaviest two-arm moves (the server then
-runs in slight slow motion; recorded data stays consistent). Closing other apps and turning off
-the camera screens (`--stream-cams ""`) helps; `--cloth-spacing 0.06` is faster but coarser.
+The simulation resolution is 5.5 cm (`--cloth-spacing`, about 280 vertices) with a 4 ms physics
+step. When the CPU can't keep up the server runs in slight slow motion; recorded data stays
+consistent. Closing other apps and turning off the camera screens (`--stream-cams ""`) helps;
+`--cloth-spacing 0.06` is faster but coarser. `--cloth-fast` uses the older collision model
+(~40 % less CPU), in which folded or crumpled fabric can cut through itself and the pale inside
+shows.
 
 **How grasping works.** Lower the open gripper until the fingertips are just above the fabric,
 then close it. The 2F-85 fingertips swing down about 18 mm as they close, and that motion
 pinches the fabric. The jaws only catch fabric if they close with cloth between the fingertips,
 so a closed gripper pushed onto the jeans does not grab them. The fabric slips out if you pull
-harder than a pinch can hold (`--slip-force`, default 30 N), and it is released when you open
-the gripper. This is a modelled pinch: the 5 cm simulation mesh cannot form the millimetre-scale
+harder than a pinch can hold (`--slip-force`, default 30 N), and it is released as soon as you
+start opening the gripper (once the pads are a few millimetres further apart than when they
+pinched, so a short flick of the stick is enough). Like real jaws, a pinch holds every layer
+between the pads: both panels at an edge, or all layers of a folded stack. This is a modelled
+pinch: the 5 cm simulation mesh cannot form the millimetre-scale
 fold that real jaws squeeze, so friction alone would never hold it. Everything else is plain
 physics. The wrist panel shows ✋ while a gripper is holding fabric.
 
@@ -58,11 +66,23 @@ lift it and lay it over the near leg. Then pinch both hems with the right arm an
 to the knees or the waist.
 
 Options: `--cloth-init crumpled` drops the jeans into a random heap on reset.
-`--cloth-spacing 0.04` gives a finer cloth but needs a fast CPU. `--randomize` also jitters the
+`--cloth-spacing 0.045` gives a finer cloth but needs a fast CPU. `--randomize` also jitters the
 jeans' heading. The laptop page shows how much the footprint has shrunk (the fold progress).
 
+**Cloth settings file.** Every garment and cloth-simulation value lives in `config/cloth.toml`,
+each with a comment on what it does, its unit and sensible values: the garment's size, mass,
+stretch, bending, shear, friction, contact settings, the physics timestep and solver budget, and
+the grip (slip force, release gap, pad friction). Edit a value and restart the server. The file
+defines several garments (`jeans`, `shorts`, `stretch_jeans`); add your own as a new
+`[garments.NAME]` table, usually starting from an existing one with `inherits = "jeans"`, and
+start it with `start.bat --garment NAME` (`--cloth-config FILE` uses another file). Misspelled
+keys and impossible sizes are reported when the server starts. Every episode stores the exact
+settings it was recorded with, so replays stay correct after you edit the file. All garments use
+the jeans pattern (two panels, two legs); the file sets their size and fabric. Check a new garment
+without the headset: `python scripts/cloth_bench.py --garment NAME --test all`.
+
 Episodes additionally contain `observations/cloth_verts` (T, N, 3), `teleop/cloth_grasp`
-(T, 2, 3), the flat pattern (`cloth/faces`, `cloth/rest_uv`) and the attributes `task`,
+(T, 2, 12: the pinched vertices of every layer between the pads, -1 = none), the flat pattern (`cloth/faces`, `cloth/rest_uv`) and the attributes `task`,
 `final_coverage` (footprint / flat footprint: 1 = spread out, about 0.25 = folded in quarters)
 and `final_height`. `replay.py --info` prints the coverage. Cloth is chaotic, so
 `--mode actions` re-simulation diverges from the recording; use the default `states` replay
@@ -70,6 +90,13 @@ for exact playback.
 
 Headset-free check of the whole pipeline: `python scripts/fake_client.py --fold` (with the
 server running with `--http`).
+
+Cloth physics benchmark: `python scripts/cloth_bench.py --test all` runs the same fold headless
+in simulation time (results don't depend on the machine) and reports thread stretch,
+penetration, cloth triangles passing through each other, jitter at rest, slips, whether released
+fabric sticks to the pads, the final fold coverage and the step cost per phase; `--test release`
+and `--test poke` repeat pinch/open and push/sweep trials. `--out sheet` also saves side-view snapshots. Use it to
+check changes to the cloth or the grasp model.
 
 ### Realism
 
@@ -279,6 +306,12 @@ python scripts/replay.py data/episode_0000.hdf5 --mode actions --video check.mp4
 --stream-cams ...    live camera screens in VR (default: left wrist, head, right wrist; '' = off)
 --cam-stream-hz 15   camera screen frame rate
 --data-dir data      output folder
+--garment NAME       jeans task: garment from the cloth settings (default: the file's `default`)
+--cloth-config FILE  jeans task: cloth settings file (default config/cloth.toml)
+--cloth-spacing M    jeans task: override the garment's simulation resolution
+--cloth-fast         jeans task: cheaper cloth collisions (folds can cut through themselves)
+--slip-force N       jeans task: override the pinch slip force
+--cloth-init crumpled  jeans task: start from a random heap
 ```
 
 ## Project layout
@@ -287,6 +320,7 @@ python scripts/replay.py data/episode_0000.hdf5 --mode actions --video check.mp4
 vrteleop/
   scene.py      MjSpec scene: room, table, 2x UR5e + 2F-85, cameras, home poses, tasks
   cloth.py      jeans pattern, flex cloth, pinch grasp model, fold metrics, denim textures
+  cloth_config.py  loads garments and cloth settings from config/cloth.toml
   textures.py   procedural floor / table textures
   ik.py         damped-least-squares differential IK (runs on a kinematic shadow MjData)
   teleop.py     clutch-based controller → EE target mapping, workspace limits
@@ -298,13 +332,17 @@ vrteleop/
 scripts/
   replay.py     inspect / replay / render episodes
   fake_client.py  headset-free end-to-end test
+  cloth_bench.py  headless cloth physics benchmark (stretch, penetration, grasp release, cost)
+  mesh_check.py   triangle-mesh self-intersection test (used by cloth_bench.py)
+config/
+  cloth.toml    garments (size, fabric) and cloth simulation / grasp settings
 assets/         MuJoCo Menagerie models (UR5e, Robotiq 2F-85; see their LICENSE files)
 ```
 
 ## Customizing
 
 - **Scene and task:** tasks live in `TASKS` / `build_spec()` in `vrteleop/scene.py` (blocks: `OBJECTS`, `BIN_POS`;
-  jeans: `JEANS_POS`, and the garment's size, mass and stiffness in `GarmentSpec` in `vrteleop/cloth.py`). The web client
+  jeans: `JEANS_POS`; the garment's size, mass and stiffness in `config/cloth.toml`). The web client
   picks up any geometry change automatically, because it receives the compiled model.
 - **Robot mounting:** `ARM_Y`, `ARM_X`, `TABLE_Z` and `HOME_Q` in `scene.py`.
 - **Controller feel:** `DiffIK` gains and `max_joint_vel` in `ik.py`. The servo damping of the arms is

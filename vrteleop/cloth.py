@@ -29,13 +29,15 @@ CLOTH_CONTYPE = 2        # vertex spheres: collide with the world (1) and each o
 CLOTH_CONAFFINITY = 3
 FLEX_FRONT = 8           # continuous cloth surface of the front panel ...
 FLEX_BACK = 16           # ... and of the back panel
-FLEX_CONTYPE = FLEX_FRONT | FLEX_BACK   # geoms with these conaffinity bits touch the cloth surface
-                                        # (the gripper finger pads)
+FLEX_CONTYPE = FLEX_FRONT | FLEX_BACK   # geoms with these conaffinity bits touch the continuous
+                                        # cloth surface (the grippers)
+FLEX_SELF = 32           # the whole garment's surface against itself (triangle-triangle)
 
 
 @dataclass
 class GarmentSpec:
-    """Dimensions of a pair of adult jeans laid flat (roughly a W32 L32 regular fit)."""
+    """Size and fabric of a garment (jeans pattern). The values used come from config/cloth.toml
+    (see cloth_config); these defaults are a pair of adult jeans laid flat (W32 L32 regular)."""
     length: float = 1.00     # waistband to hem [m]
     rise: float = 0.27       # waistband to crotch
     waist: float = 0.39      # flat width at the waistband
@@ -52,7 +54,22 @@ class GarmentSpec:
     # cloth-on-cloth contacts: 1 = frictionless (layers slide on each other). Friction with the
     # table and the finger pads is unaffected. 3 adds denim-on-denim friction at ~20 % more cost.
     self_condim: int = 1
-    both_way: bool = False     # both panels' spheres touch the other panel's surface
+    # Layers must never pass through each other (the pale inside would show). Each vertex sphere
+    # touches the continuous surface of both panels (the other panel, and its own panel where it
+    # is folded onto itself), and the surface also collides with itself triangle against
+    # triangle, which catches edges slicing between the spheres. ~60 % more CPU than the older,
+    # faster model (both_way/own_panel/self_collide False, sphere_pairs True), which lets
+    # folds and crumples cut through themselves (`--cloth-fast`).
+    both_way: bool = True      # both panels' spheres touch the other panel's surface
+    own_panel: bool = True     # spheres also touch their own panel's surface (folds onto itself)
+    sphere_pairs: bool = False  # vertex spheres also touch each other
+    self_collide: bool = True  # triangle-triangle collisions of the whole surface with itself
+    # Contacts of the cloth surface start 6 mm before layers touch and push from 3 mm: layers
+    # squeezed together fast (a leg compressed between the grippers buckles into sharp folds)
+    # are caught before they slice through each other; without it they tunnel, interlock and
+    # the contact count explodes (the sim then crawls). Layers rest 3 mm further apart.
+    surface_margin: float = 0.006
+    surface_gap: float = 0.003
     layer_gap: float = 0.012   # front panel rests this far above the back panel (> 2 * sphere_r)
     damping: float = 0.004
     shear_stiffness: float = 8.0   # bias springs [N/m]: woven denim shears easily
@@ -62,11 +79,16 @@ class GarmentSpec:
     edge_solimp: tuple = (0.95, 0.99, 0.001, 0.5, 2)
 
 
+# The older, cheaper collision model (--cloth-fast): folds and crumples can cut through themselves.
+FAST_COLLISIONS = dict(both_way=False, own_panel=False, sphere_pairs=True, self_collide=False)
+
+
 @dataclass
 class ClothInfo:
     name: str
     rest_uv: np.ndarray                      # (N, 2) flat pattern coordinates [m]
     faces: np.ndarray                        # (F, 3) triangle vertex indices
+    face_layer: np.ndarray                   # (F,) panel of each face: 0 = front, 1 = back
     texcoord: np.ndarray                     # (T, 2) texture coordinates in [0, 1] (texture atlas)
     face_tc: np.ndarray                      # (F, 3) index into texcoord for each face corner
     garment: GarmentSpec
@@ -272,6 +294,15 @@ def add_garment(spec: mujoco.MjSpec, name: str, pos, yaw: float, g: GarmentSpec 
     names = list(whole.vertbody)
     nF = len(faces) // 2
     flex_names = [whole.name]
+    layer_of = dict(zip(names, J["layer"]))
+    if g.self_collide:
+        # Safety net: the garment's surface also collides with itself, triangle against
+        # triangle (MuJoCo flex self-collision). The vertex spheres keep stacked layers apart,
+        # but they sit 5 cm apart, and in folds and crumples the triangles between them
+        # would otherwise slice through each other (the pale inside then shows).
+        whole.contype = whole.conaffinity = FLEX_SELF
+        whole.selfcollide = mujoco.mjtFlexSelf.mjFLEXSELF_AUTO
+        whole.margin, whole.gap = g.surface_margin, g.surface_gap
     for part, (lay, fc, bit) in {"front": ((0, 2), faces[:nF], FLEX_FRONT),
                                 "back": ((1, 2), faces[nF:], FLEX_BACK)}.items():
         vs = np.where(np.isin(J["layer"], lay))[0]
@@ -287,9 +318,10 @@ def add_garment(spec: mujoco.MjSpec, name: str, pos, yaw: float, g: GarmentSpec 
         f.elem = local[fc].ravel().tolist()
         f.contype, f.conaffinity = bit, 0
         f.condim, f.friction, f.solref = whole.condim, whole.friction, whole.solref
-        f.selfcollide, f.internal = whole.selfcollide, whole.internal
+        f.selfcollide = mujoco.mjtFlexSelf.mjFLEXSELF_NONE   # self contact: the whole flex
+        f.internal = whole.internal
+        f.margin, f.gap = g.surface_margin, g.surface_gap
         f.young = 0.0                             # no elasticity: contact only
-        layer_of = dict(zip(names, J["layer"]))
     # one collision sphere per vertex body (hidden: group 3)
     vbodies = []
     for b in child.bodies:
@@ -306,6 +338,10 @@ def add_garment(spec: mujoco.MjSpec, name: str, pos, yaw: float, g: GarmentSpec 
             # One direction is enough to stop the panels passing through each other (from
             # either side) and halves the number of contacts.
             gm.conaffinity = 1 | CLOTH_CONTYPE | ({0: FLEX_BACK, 1: FLEX_FRONT}.get(int(lay), 0) if g.both_way else (FLEX_BACK if int(lay) == 0 else 0))
+            if g.own_panel:
+                gm.conaffinity |= {0: FLEX_FRONT, 1: FLEX_BACK}.get(int(lay), FLEX_FRONT | FLEX_BACK)
+            if not g.sphere_pairs:
+                gm.conaffinity &= ~CLOTH_CONTYPE
             # condim is combined with max(): contacts with the table and the finger pads keep
             # friction (condim 3), cloth-on-cloth contacts use g.self_condim
             gm.condim = g.self_condim
@@ -323,18 +359,19 @@ def add_garment(spec: mujoco.MjSpec, name: str, pos, yaw: float, g: GarmentSpec 
     frame.pos = list(pos)
     frame.quat = [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
     frame.attach_body(child.body(name), "", "")
-    # Neighbouring vertices are far apart (spacing >> 2r), except across the crotch where
-    # the two inseams start at the same point: exclude those few sphere pairs. (The front
-    # and back panel lie layer_gap > 2r apart, so they do collide: jeans can't fold through
-    # themselves.)
-    p3 = np.c_[uv, J["z"]]
-    close = np.linalg.norm(p3[:, None] - p3[None], axis=2) < 2.2 * g.sphere_r
-    pairs = {tuple(p) for p in zip(*np.nonzero(np.triu(close, 1)))}
-    # front/back twins: kept apart by the panel surfaces, their spheres would only add contacts
-    pairs |= {tuple(sorted(map(int, t))) for t in J["twins"]}
-    for i, j in sorted(pairs):
-        ex = spec.add_exclude()
-        ex.bodyname1, ex.bodyname2 = vbodies[i], vbodies[j]
+    if g.sphere_pairs:
+        # Neighbouring vertices are far apart (spacing >> 2r), except across the crotch where
+        # the two inseams start at the same point: exclude those few sphere pairs. (The front
+        # and back panel lie layer_gap > 2r apart, so they do collide: jeans can't fold through
+        # themselves.)
+        p3 = np.c_[uv, J["z"]]
+        close = np.linalg.norm(p3[:, None] - p3[None], axis=2) < 2.2 * g.sphere_r
+        pairs = {tuple(p) for p in zip(*np.nonzero(np.triu(close, 1)))}
+        # front/back twins: kept apart by the panel surfaces, their spheres would only add contacts
+        pairs |= {tuple(sorted(map(int, t))) for t in J["twins"]}
+        for i, j in sorted(pairs):
+            ex = spec.add_exclude()
+            ex.bodyname1, ex.bodyname2 = vbodies[i], vbodies[j]
     # Woven fabric: the threads (warp along the leg, weft across) barely stretch, but the cloth
     # shears easily on the bias. Constraining every triangle edge (flex edge equality) also
     # locks shear, and on a coarse mesh that makes the jeans move like cardboard. So: thread
@@ -364,8 +401,8 @@ def add_garment(spec: mujoco.MjSpec, name: str, pos, yaw: float, g: GarmentSpec 
         t.wrap_site(f"{vbodies[i]}_s"); t.wrap_site(f"{vbodies[j]}_s")
         t.stiffness = [g.shear_stiffness, 0.0, 0.0]
         t.damping = [g.damping, 0.0, 0.0]
-    info = ClothInfo(name=name, rest_uv=uv, faces=faces, texcoord=J["tc"], face_tc=J["face_tc"],
-                     garment=g, vert_bodies=names)
+    info = ClothInfo(name=name, rest_uv=uv, faces=faces, face_layer=np.repeat([0, 1], nF),
+                     texcoord=J["tc"], face_tc=J["face_tc"], garment=g, vert_bodies=names)
     info.flex_names = flex_names
     return info
 
@@ -722,17 +759,26 @@ class PinchGrasp:
         is pushed onto the cloth), once the jaws are nearly shut or stalled on fabric;
       * the fabric surface must be between the fingertips at that moment (the
         closest point on the cloth surface lies inside the jaw volume);
-      * the pinched patch (the triangle under the fingertips) is held at the pose
-        it had relative to the gripper, via soft `connect` equality constraints;
+      * the pinched patch is held at the pose it had relative to the gripper, via soft
+        `connect` equality constraints: the triangle under the fingertips *in every layer*
+        between the pads (both panels of the jeans, or all layers of a folded stack), as
+        real jaws squeeze everything between them. Holding only one layer would drag it
+        through the others;
       * it slips out if the pull exceeds what a pinch can hold (`slip_force`),
-        and is released as soon as the jaws open.
+        and is released as soon as the jaws open: once the pads are `release_gap`
+        further apart than when they pinched, nothing squeezes the fabric any more
+        (a small flick of the stick lets go, as with a real gripper).
     Everything else (contact with the table, the pads pushing fabric, the fabric
     colliding with itself, draping, bending) is ordinary MuJoCo physics.
     """
-    K = 3                      # vertices held per gripper (one triangle)
+    MAX_LAYERS = 4             # fabric layers one pinch can hold (one triangle each)
+    K = 3 * MAX_LAYERS         # vertices held per gripper at most
+    LAYER_GAP = 0.008          # a second triangle of the same panel counts as another (folded)
+                               # layer if its surface is this far away along the closing axis [m]
     JAW_TRIGGER = 0.80         # jaw closure (0 open .. 1 closed) at which a pinch is attempted
     JAW_STALL = 0.45           # ... or at which a stalled closing jaw counts as "on fabric"
     JAW_RELEASE = 0.40
+    RELEASE_GAP = 0.004        # pads this much further apart than at the pinch [m]: fabric is free
     CMD_CLOSE = 0.5
     # jaw volume in the pinch-site frame (x: across the pads, y: closing axis, z: toward the tips)
     HALF_WIDTH = 0.011 + 0.010     # pad half width + margin
@@ -740,7 +786,7 @@ class PinchGrasp:
     Z_RANGE = (-0.020, 0.0177 + 0.008)
 
     def __init__(self, m: mujoco.MjModel, cloth: ClothInfo, side: str, eq_ids: list[int],
-                 slip_force: float = 30.0):
+                 slip_force: float = 30.0, release_gap: float = RELEASE_GAP):
         self.cloth = cloth
         self.side = side
         self.eq_ids = list(eq_ids)
@@ -748,7 +794,10 @@ class PinchGrasp:
         self.site = m.site(f"{side}_gripper_pinch").id
         self.driver_q = m.jnt_qposadr[m.joint(f"{side}_gripper_right_driver_joint").id]
         self.slip_force = slip_force
+        self.release_gap = release_gap
         self.held: list[int] = []            # cloth vertex indices (0..N-1)
+        self._gap0 = 0.0                     # tightest pad gap while pinching [m]
+        self.slips = 0                       # vertices pulled out of a closed pinch (diagnostics)
         self._armed = True
         self._stall_t = 0.0
         self._prev_jaw = 0.0
@@ -771,6 +820,11 @@ class PinchGrasp:
     def _jaw(self, d):
         return float(np.clip(d.qpos[self.driver_q] / 0.8, 0, 1))
 
+    @staticmethod
+    def pad_gap(jaw: float) -> float:
+        """Distance between the 2F-85 finger pads [m] at jaw closure 0 (open) .. 1 (closed)."""
+        return 2 * (0.0466 * (1 - jaw) + 0.0042 * jaw)
+
     def update(self, m: mujoco.MjModel, d: mujoco.MjData, grip_cmd: float, dt: float):
         jaw = self._jaw(d)
         closing = grip_cmd >= self.CMD_CLOSE
@@ -781,7 +835,12 @@ class PinchGrasp:
                 self._armed = True
             self._stall_t = 0.0
         elif self.held:
-            self._check_slip(m, d)
+            gap = self.pad_gap(jaw)
+            self._gap0 = min(self._gap0, gap)  # the jaws keep closing after the pinch triggers
+            if gap > self._gap0 + self.release_gap:
+                self.release(m, d)             # jaws opened: the pads no longer squeeze the fabric
+            else:
+                self._check_slip(m, d)
         elif self._armed:
             stalled = jaw > self.JAW_STALL and abs(jaw - self._prev_jaw) < 0.02 * dt / 0.01
             self._stall_t = self._stall_t + dt if stalled else 0.0
@@ -804,22 +863,32 @@ class PinchGrasp:
         a, b, c = V[F[cand, 0]], V[F[cand, 1]], V[F[cand, 2]]
         q = closest_points_on_triangles(centre[None, :], a, b, c)
         loc = (q - p) @ R                        # site frame
-        half_gap = 0.0466 * (1 - jaw) + 0.0042 * jaw + self.HALF_GAP_MARGIN
+        half_gap = self.pad_gap(jaw) / 2 + self.HALF_GAP_MARGIN
         ok = ((np.abs(loc[:, 0]) <= self.HALF_WIDTH) & (np.abs(loc[:, 1]) <= half_gap)
               & (loc[:, 2] >= self.Z_RANGE[0]) & (loc[:, 2] <= self.Z_RANGE[1]))
         if not ok.any():
             return
         dist = np.linalg.norm(q - centre, axis=1)
-        dist[~ok] = np.inf
-        tri = F[cand[int(np.argmin(dist))]]
+        # nearest triangle first, then one per further layer between the pads: the other panel,
+        # or the same panel folded over (its surface clearly apart along the closing axis)
+        layers: list[tuple[int, float]] = []        # (panel, closing-axis offset) of each held layer
+        held: list[int] = []
+        for i in np.where(ok)[0][np.argsort(dist[ok])]:
+            panel, y = int(self.cloth.face_layer[cand[i]]), float(loc[i, 1])
+            if all(panel != pl or abs(y - yl) > self.LAYER_GAP for pl, yl in layers):
+                layers.append((panel, y))
+                held += [int(v) for v in F[cand[i]] if v not in held]
+                if len(layers) == self.MAX_LAYERS:
+                    break
         Rb = d.xmat[self.body].reshape(3, 3)
         pb = d.xpos[self.body]
-        for e, vi in zip(self.eq_ids, tri):
+        for e, vi in zip(self.eq_ids, held):
             m.eq_obj2id[e] = self.vert_body[vi]
             m.eq_data[e, 0:3] = Rb.T @ (V[vi] - pb)     # anchor in the gripper frame
             m.eq_data[e, 3:6] = 0.0                     # the vertex itself
             d.eq_active[e] = 1
-        self.held = [int(v) for v in tri]
+        self.held = held
+        self._gap0 = self.pad_gap(jaw)
 
     def _check_slip(self, m, d):
         if d.nefc == 0:
@@ -832,6 +901,7 @@ class PinchGrasp:
             f = float(np.linalg.norm(d.efc_force[:d.nefc][rows])) if rows.any() else 0.0
             if f > self.slip_force:
                 d.eq_active[e] = 0
+                self.slips += 1
             else:
                 keep.append(vi)
         if len(keep) != len(self.held):

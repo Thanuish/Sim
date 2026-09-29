@@ -19,7 +19,7 @@ Layout (T = number of frames, sampled at a fixed rate in *sim* time):
     /teleop/engaged                 (T, 2)      bool
     /teleop/head_pose               (T, 7)      operator head in MuJoCo frame (nan if unknown)
     /teleop/controller_pose         (T, 2, 7)
-    /teleop/cloth_grasp             (T, 2, 3)   cloth vertices pinched by [left, right] gripper (-1 = none)
+    /teleop/cloth_grasp             (T, 2, 12)  cloth vertices pinched by [left, right] gripper (-1 = none)
 
 Cloth episodes also store /cloth/faces (F, 3) and /cloth/rest_uv (N, 2) (the flat pattern
 in metres), and root attrs final_coverage / final_height (see cloth.fold_metrics).

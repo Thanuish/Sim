@@ -25,6 +25,7 @@ import numpy as np
 from aiohttp import WSMsgType, web
 
 from . import cloth as C
+from . import cloth_config as CC
 from . import scene as S
 from .ik import DiffIK
 from .pipeline import Session
@@ -40,7 +41,7 @@ PROTOCOL_VERSION = 5        # bump when server <-> web client messages change
 class TeleopSim:
     def __init__(self, args):
         self.args = args
-        self.info = S.build_scene(args.task, args.cloth_spacing)
+        self.info = S.build_scene(args.task, cloth_config_from_args(args))
         self.m = self.info.model
         self.d = mujoco.MjData(self.m)
         self.rng = np.random.default_rng(args.seed)
@@ -51,8 +52,10 @@ class TeleopSim:
         self.cloth = self.info.cloth
         self.grasp = {}
         if self.cloth is not None:
+            cc = self.info.cloth_config
             self.grasp = {s: C.PinchGrasp(self.m, self.cloth, s, self.info.grasp_eq[s],
-                                          slip_force=args.slip_force) for s in S.SIDES}
+                                          slip_force=cc.slip_force, release_gap=cc.release_gap)
+                          for s in S.SIDES}
         self.cloth_metrics = {}
         self._metrics_t = 0.0
         self.render_bodies, self.scene_gz = export_scene(self.m, cloth=self.cloth,
@@ -239,7 +242,9 @@ class TeleopSim:
             self.update_cloth_metrics()
             extra = {"final_coverage": self.cloth_metrics["coverage"],
                      "final_height": self.cloth_metrics["height"],
-                     "cloth_spacing": self.cloth.garment.spacing}
+                     "cloth_spacing": self.cloth.garment.spacing,
+                     "garment": self.info.cloth_config.name,
+                     "cloth_config": self.info.cloth_config.to_json()}   # rebuilds it exactly
         n_frames = self.recorder.num_frames
         path = self.recorder.stop(self.m.opt.timestep, success=success, extra_attrs=extra)
         if path:
@@ -394,7 +399,7 @@ def make_app(sim: TeleopSim) -> web.Application:
     app = web.Application(middlewares=[no_cache_app_js])
 
     boot_id = str(int(time.time()))
-    index_html = (WEB_DIR / "index.html").read_text().replace(
+    index_html = (WEB_DIR / "index.html").read_text(encoding="utf-8").replace(
         "/static/main.js", f"/static/main.js?v={boot_id}")   # never run a stale cached client
 
     async def index(_):
@@ -466,7 +471,7 @@ def lan_ips() -> list[str]:
     return sorted(ips)
 
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=None, help="default 8443 (https) / 8080 (http)")
@@ -486,11 +491,19 @@ def main(argv=None):
                    help="jeans: fold a pair of jeans (cloth); blocks: pick-and-place into a bin")
     p.add_argument("--cloth-init", choices=["flat", "crumpled"], default="flat",
                    help="jeans task: start spread flat, or dropped into a random heap")
+    p.add_argument("--garment", default=None,
+                   help="jeans task: garment from the cloth config (default: its `default`), e.g. "
+                        "jeans, shorts, stretch_jeans")
+    p.add_argument("--cloth-config", default=None,
+                   help="jeans task: cloth settings file (default: config/cloth.toml)")
     p.add_argument("--cloth-spacing", type=float, default=None,
-                   help="jeans task: cloth simulation resolution [m] (default 0.05; 0.04 is finer but "
-                        "needs a fast CPU to stay real time)")
-    p.add_argument("--slip-force", type=float, default=30.0,
-                   help="jeans task: pull [N] at which fabric slips out of a pinch")
+                   help="jeans task: override the garment's simulation resolution [m] (0.045 is finer "
+                        "but needs a fast CPU)")
+    p.add_argument("--cloth-fast", action="store_true",
+                   help="jeans task: cheaper cloth collisions (~40 %% less CPU), but folded or crumpled "
+                        "fabric can cut through itself")
+    p.add_argument("--slip-force", type=float, default=None,
+                   help="jeans task: override the pull [N] at which fabric slips out of a pinch")
     p.add_argument("--randomize", type=float, default=0.05,
                    help="object xy jitter on reset [m] (jeans: also +/- 3x this in heading [rad])")
     p.add_argument("--seed", type=int, default=None)
@@ -507,12 +520,38 @@ def main(argv=None):
     p.add_argument("--public-host", default=os.environ.get("TELEOP_PUBLIC_HOST", ""),
                    help="address(es) the headset uses to reach this machine, comma separated "
                         "(needed in Docker, where the container can't see the host's IP)")
-    args = p.parse_args(argv)
+    return p
+
+
+def cloth_config_from_args(args) -> CC.ClothConfig | None:
+    """The garment from the cloth config file, with command-line overrides applied."""
+    if args.task != "jeans":
+        return None
+    over = {}
+    if args.cloth_spacing:
+        over["spacing"] = args.cloth_spacing
+    if args.cloth_fast:
+        over.update(C.FAST_COLLISIONS)
+    cfg = CC.load(args.garment, args.cloth_config, over)
+    if args.slip_force is not None:
+        cfg.slip_force = args.slip_force
+    return cfg
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     if not S.UR5E_XML.exists() or not S.GRIPPER_XML.exists():
         sys.exit("Robot assets missing. Run:  python setup_assets.py")
 
-    sim = TeleopSim(args)
+    try:
+        sim = TeleopSim(args)
+    except CC.ConfigError as e:
+        sys.exit(f"Cloth config error: {e}")
+    if sim.info.cloth_config is not None:
+        cc = sim.info.cloth_config
+        print(f"[cloth] garment '{cc.name}' from {args.cloth_config or CC.DEFAULT_PATH}: "
+              f"spacing {cc.garment.spacing} m, mass {cc.garment.mass} kg, timestep {cc.timestep * 1e3:.0f} ms")
     app = make_app(sim)
     public = [h.strip() for h in args.public_host.split(",") if h.strip()]
     ips = public + ["127.0.0.1"] if public else lan_ips()

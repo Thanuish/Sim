@@ -22,6 +22,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vrteleop import cloth as C  # noqa: E402
+from vrteleop import cloth_config as CC  # noqa: E402
 from vrteleop import scene as S  # noqa: E402
 
 
@@ -63,11 +64,19 @@ def main():
     task = h.attrs.get("task", "blocks")          # episodes recorded before tasks existed: blocks
     if isinstance(task, bytes):
         task = task.decode()
-    sc = S.build_scene(task, h.attrs.get("cloth_spacing"))
+    cloth = None
+    if task == "jeans":
+        if "cloth_config" in h.attrs:                 # the exact garment and settings recorded
+            cloth = CC.ClothConfig.from_json(h.attrs["cloth_config"])
+        else:                                         # older episodes: default garment, recorded spacing
+            sp = h.attrs.get("cloth_spacing")
+            cloth = CC.load(overrides={"spacing": float(sp)} if sp else None)
+    sc = S.build_scene(task, cloth)
     m, d = sc.model, mujoco.MjData(sc.model)
     grasp = {}
     if sc.cloth is not None:
-        grasp = {s: C.PinchGrasp(m, sc.cloth, s, sc.grasp_eq[s]) for s in S.SIDES}
+        grasp = {s: C.PinchGrasp(m, sc.cloth, s, sc.grasp_eq[s], slip_force=cloth.slip_force,
+                                 release_gap=cloth.release_gap) for s in S.SIDES}
     if h["observations/full_qpos"].shape[1] != m.nq:
         sys.exit(f"episode state size {h['observations/full_qpos'].shape[1]} != model nq {m.nq}: "
                  f"the scene changed since this episode was recorded")
