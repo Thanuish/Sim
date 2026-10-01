@@ -1,4 +1,4 @@
-"""GPU jeans test: the scripted fold without robots (pinned patches stand in for the grippers).
+﻿"""GPU jeans test: the scripted fold without robots (pinned patches stand in for the grippers).
 
     python scripts/gpu_cloth_test.py                 # 1.2 cm, render to gpu_fold.png
     python scripts/gpu_cloth_test.py --spacing 0.01 --out fold_1cm
@@ -95,7 +95,7 @@ def main():
     ap.add_argument("--spacing", type=float, default=0.012)
     ap.add_argument("--substeps", type=int, default=20)
     ap.add_argument("--thickness", type=float, default=1.0, help="self-collision distance / spacing")
-    ap.add_argument("--arch", default="vulkan")
+    ap.add_argument("--arch", default="gpu", help="gpu (best available), vulkan, cuda, metal or cpu")
     ap.add_argument("--out", default="gpu_fold")
     a = ap.parse_args()
     G.init(a.arch)

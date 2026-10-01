@@ -100,7 +100,7 @@ class GPUCloth(ClothEngine):
     render_subdiv = 0                   # 1 cm is smooth already; each level is 4x the headset's work
     P = C.PinchGrasp                    # jaw geometry and trigger thresholds
 
-    def __init__(self, info: S.SceneInfo, arch: str = "vulkan"):
+    def __init__(self, info: S.SceneInfo, arch: str = "gpu"):
         from . import gpu_cloth as G    # Taichi is only needed when this engine is used
         G.init(arch)
         m = self.model = info.model

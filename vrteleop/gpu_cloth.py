@@ -27,12 +27,19 @@ _initialised = None
 FREE, WORLD = -1, 2          # pin modes; 0 / 1 = pinned to gripper 0 / 1 (left / right)
 
 
-def init(arch: str = "vulkan"):
-    """Start Taichi once per process (arch: vulkan, cuda, cpu)."""
+def init(arch: str = "gpu"):
+    """Start Taichi once per process. arch: gpu (the best available: CUDA, Vulkan or Metal),
+    vulkan, cuda, metal or cpu. Raises RuntimeError if a GPU was asked for and there is none
+    (Taichi would quietly run on the CPU, far too slowly for real time)."""
     global _initialised
     if _initialised is None:
         ti.init(arch=getattr(ti, arch), log_level=ti.WARN, random_seed=0)
-        _initialised = arch
+        got = ti.lang.impl.current_cfg().arch
+        _initialised = str(got).split(".")[-1]
+        if arch != "cpu" and got in (ti.cpu, ti.x64, ti.arm64):
+            raise RuntimeError(f"no GPU for the cloth (Taichi found no {arch} backend)")
+    elif arch != "cpu" and _initialised in ("x64", "arm64", "cpu"):
+        raise RuntimeError("no GPU for the cloth")
     return _initialised
 
 
