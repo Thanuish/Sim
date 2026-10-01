@@ -6,3 +6,7 @@ h5py>=3.10
 cryptography>=42
 imageio[ffmpeg]>=2.34
 Pillow>=10
+# GPU cloth (XPBD) on any Vulkan GPU (AMD, NVIDIA, Intel); gpu-cloth branch
+taichi==1.7.4
+# MCP server for Claude / MCP clients (vrteleop/mcp_server.py)
+mcp>=1.10,<2

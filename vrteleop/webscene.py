@@ -89,8 +89,9 @@ def _materials(m: mujoco.MjModel, tex: _Textures, used: set[int]):
 
 
 def export_scene(m: mujoco.MjModel, max_group: int = 2, cloth: C.ClothInfo | None = None,
-                 web_textures: dict | None = None, subdiv_levels: int = 2):
-    """Returns (render_body_ids, gzipped JSON bytes)."""
+                 web_textures: dict | None = None, subdiv_levels: int = 2, cloth_material: int = -1):
+    """Returns (render_body_ids, gzipped JSON bytes). `cloth` is the garment pattern; a cloth
+    simulated outside MuJoCo (no flex, flex_id < 0) gets its material from `cloth_material`."""
     body_index: dict[int, int] = {}
     render_bodies: list[int] = []
     geoms = []
@@ -152,7 +153,7 @@ def export_scene(m: mujoco.MjModel, max_group: int = 2, cloth: C.ClothInfo | Non
     flexes = []
     if cloth is not None:
         fid = cloth.flex_id
-        matid = int(m.flex_matid[fid])
+        matid = int(m.flex_matid[fid]) if fid >= 0 else int(cloth_material)
         if matid >= 0:
             used_mats.add(matid)
         # Render mesh: one vertex per (sim vertex, texture coordinate) pair, so the seams
@@ -178,7 +179,7 @@ def export_scene(m: mujoco.MjModel, max_group: int = 2, cloth: C.ClothInfo | Non
             "nfine": int(n_fine),
             "w_rows": _b64(rows), "w_cols": _b64(cols), "w_vals": _b64(vals),
             "faces": _b64(fine_faces), "uv": _b64(uv_fine),
-            "thickness": float(m.flex_radius[fid]),
+            "thickness": float(m.flex_radius[fid]) if fid >= 0 else 0.0,
         })
 
     payload = {

@@ -60,9 +60,11 @@ class Bench:
                                           *server_args])
         self.sim = sim = TeleopSim(args)
         self.m, self.d = sim.m, sim.d
-        self.cloth = sim.cloth
+        # the bench measures MuJoCo internals (thread tendons, contacts, the pinch's slip counter)
+        self.cloth = sim.cloth.info
+        self.grasp = sim.cloth.grasp
         self.ctrl_dt = 1.0 / args.control_hz
-        self.home = {s: sim.teleop[s].target_pos.copy() for s in S.SIDES}
+        self.home = {s: sim.arms.teleop[s].target_pos.copy() for s in S.SIDES}
         self.target = {s: self.home[s].copy() for s in S.SIDES}
         self.stick = {s: 0.0 for s in S.SIDES}
         self._next_input = 0.0
@@ -93,12 +95,12 @@ class Bench:
     def reset(self, randomize: float = 0.0):
         """Back to the start pose (sim time restarts at 0); `randomize` jitters the jeans' pose."""
         self.sim.reset(randomize=randomize)
-        self.home = {s: self.sim.teleop[s].target_pos.copy() for s in S.SIDES}
+        self.home = {s: self.sim.arms.teleop[s].target_pos.copy() for s in S.SIDES}
         self.target = {s: self.home[s].copy() for s in S.SIDES}
         self.stick = {s: 0.0 for s in S.SIDES}
         self._next_input = 0.0
         self._held = {s: [] for s in S.SIDES}
-        self._slips = {s: g.slips for s, g in self.sim.grasp.items()}
+        self._slips = {s: g.slips for s, g in self.grasp.items()}
         self._released = []
 
     # ------------------------------------------------------------- stepping
@@ -145,7 +147,7 @@ class Bench:
                 for key, sel in (("pen_self", both), ("pen_robot", robot), ("pen_world", world)):
                     if sel.any():
                         self.worst[key] = max(self.worst.get(key, 0.0), float(-con.dist[sel].min()))
-        for s, g in self.sim.grasp.items():
+        for s, g in self.grasp.items():
             before, now = self._held[s], list(g.held)
             if before and not now and g.slips == self._slips[s]:     # let go, not pulled out
                 z0 = float(C.verts(self.cloth, d)[before, 2].mean())
@@ -171,7 +173,7 @@ class Bench:
         self.phases.append((name, self.d.time - t_sim, time.perf_counter() - t_wall))
         self.crossings = max(self.crossings, self.n_crossings())
         if "release" in name:        # the operator has opened the gripper(s) and moved away
-            self.stuck += sum(g.holding for g in self.sim.grasp.values())
+            self.stuck += sum(g.holding for g in self.grasp.values())
         self.snapshot(name)
 
     def snapshot(self, label: str, lookat=None, distance: float = 1.45):
@@ -261,14 +263,14 @@ class Bench:
                 self.move({"right": g + [0, 0, 0.08]}, 1.2)
                 self.move({"right": g}, 0.8)
                 self.move({}, 0.8, close={"right": True})
-                held = bool(self.sim.grasp["right"].holding)
+                held = bool(self.grasp["right"].holding)
                 if flick == "air":
                     # lift the corner high, open fully while the leg hangs: the fabric must drop
                     self.move({"right": g + [0, 0, 0.30]}, 1.5)
                     self.advance(0.5)
                     self.move({}, 0.9, close={"right": False})
                     self.advance(1.5)
-                    still = bool(self.sim.grasp["right"].holding)
+                    still = bool(self.grasp["right"].holding)
                     hang = float(C.verts(self.cloth, self.d)[:, 2].max() - S.TABLE_Z)
                     results.append((flick, k, held, still, hang))
                     self.snapshot(f"opened in the air {k}", lookat=self.sim.ee_pose("right")[0] - [0, 0, 0.12],
@@ -280,7 +282,7 @@ class Bench:
                 self.move({}, flick, close={"right": False})
                 self.move({"right": g + [0, 0, 0.12]}, 0.8)
                 self.advance(0.2)
-                still = bool(self.sim.grasp["right"].holding)
+                still = bool(self.grasp["right"].holding)
                 f = self.follow[n_follow] if len(self.follow) > n_follow else float("nan")
                 results.append((flick, k, held, still, f))
         print(f"\n  release trials ({n_points} grasp points x short flick / full open on the table /"
@@ -336,7 +338,7 @@ class Bench:
                     self.move({"right": p + [0.0, 0.0, 0.25]}, 1.2)
                     self.advance(0.5)
                     z = C.verts(self.cloth, self.d)[:, 2] - S.TABLE_Z
-                    results.append((motion, closed, k, bool(self.sim.grasp["right"].holding),
+                    results.append((motion, closed, k, bool(self.grasp["right"].holding),
                                     float(z.max()), int((z > 0.03).sum()), self.n_crossings()))
                     self.snapshot(f"{motion} {'closed' if closed else 'open'} {k}",
                                   lookat=[u, 0.5 * (y0 + y1), S.TABLE_Z + 0.08], distance=0.9)
@@ -365,7 +367,7 @@ class Bench:
              "solver_iters": float(np.mean(self.solver_iters)), "solver_iters_max": max(self.solver_iters),
              "penetration_mm": 1e3 * self.worst["penetration"],
              **{f"{k}_mm": 1e3 * self.worst.get(k, 0.0) for k in ("pen_world", "pen_self", "pen_robot")},
-             "jitter_mm_s": 1e3 * self.jitter, "slips": sum(g.slips for g in self.sim.grasp.values()),
+             "jitter_mm_s": 1e3 * self.jitter, "slips": sum(g.slips for g in self.grasp.values()),
              "follow_mm": 1e3 * max(self.follow, default=0.0), "releases": len(self.follow),
              "stuck": self.stuck, "crossings": self.crossings,
              "coverage": cov, "cost_s_per_s": wall_t / sim_t}

@@ -269,7 +269,7 @@ async function loadScene() {
     bodyObjs[g.body].add(mesh);
   }
   cloths = (js.flexes || []).map(fx => makeCloth(fx, mats));
-  window.__teleop = { scene, cloths };        // debugging handle (browser console)
+  window.__teleop = { scene, cloths, camera, orbit };        // debugging handle (browser console)
   document.getElementById('loading').style.display = 'none';
 }
 
@@ -323,6 +323,7 @@ window.addEventListener('keydown', (e) => {
 
 // ---------------------------------------------------------------- network
 let ws = null, wsOpen = false, status = {};
+let sceneId = null, reloading = false;   // the server rebuilt its scene (e.g. another garment)
 const connEl = document.getElementById('conn');
 function connect() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
@@ -330,18 +331,36 @@ function connect() {
   ws.onopen = () => { wsOpen = true; connEl.className = 'ok'; };
   ws.onclose = () => { wsOpen = false; connEl.className = 'bad'; setTimeout(connect, 1000); };
   ws.onmessage = (ev) => {
-    if (typeof ev.data === 'string') { status = JSON.parse(ev.data); updateHud(); return; }
+    if (typeof ev.data === 'string') {
+      status = JSON.parse(ev.data);
+      if (status.scene_id !== undefined) {
+        if (sceneId !== null && status.scene_id !== sceneId && !reloading) {
+          reloading = true;
+          loadScene().finally(() => { reloading = false; });
+        }
+        sceneId = status.scene_id;
+      }
+      updateHud();
+      return;
+    }
     const kind = new Uint8Array(ev.data, 0, 1)[0];
     if (kind === 2) { onCameraFrame(new Uint8Array(ev.data, 1, 1)[0], ev.data.slice(4)); return; }
     const f = new Float32Array(ev.data, 4);
     const flags = f[1], nb = f[2];
     if (nb !== bodyObjs.length) return;
     let k = 4;
-    for (let i = 0; i < nb; i++, k += 7) {
-      const o = bodyObjs[i];
-      o.position.set(f[k], f[k + 1], f[k + 2]);
-      o.quaternion.set(f[k + 4], f[k + 5], f[k + 6], f[k + 3]);
+    // robot poses: shown interpolated between the last two packets (smoothBodies), so the arms
+    // move smoothly at the headset's frame rate however often the server sends
+    const now = performance.now();
+    if (!bodyPose.cur || bodyPose.cur.length !== 7 * nb) {
+      bodyPose.prev = f.slice(k, k + 7 * nb); bodyPose.cur = bodyPose.prev.slice();
+    } else {
+      bodyPose.prev.set(bodyPose.cur); bodyPose.cur.set(f.subarray(k, k + 7 * nb));
+      const gap = Math.min(Math.max(now - bodyPose.t, 4), 120);
+      bodyPose.interval += 0.2 * (gap - bodyPose.interval);
     }
+    bodyPose.t = now;
+    k += 7 * nb;
     for (let a = 0; a < 2; a++, k += 7) {
       targets[a].position.set(f[k], f[k + 1], f[k + 2]);
       targets[a].quaternion.set(f[k + 4], f[k + 5], f[k + 6], f[k + 3]);
@@ -444,10 +463,10 @@ window.addEventListener('keydown', (e) => {
 
 // In-VR panel on the left wrist
 const hudCanvas = document.createElement('canvas');
-hudCanvas.width = 512; hudCanvas.height = 256;
+hudCanvas.width = 512; hudCanvas.height = 384;
 const hudTex = new THREE.CanvasTexture(hudCanvas);
 hudTex.colorSpace = THREE.SRGBColorSpace;
-const hudMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.08),
+const hudMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.12),
   new THREE.MeshBasicMaterial({ map: hudTex, transparent: true }));
 hudMesh.position.set(0, 0.06, 0.03);
 hudMesh.rotation.x = -0.9;
@@ -459,7 +478,13 @@ function updateHud() {
   const rec = s.recording;
   const cov = s.cloth && s.cloth.coverage !== undefined ? `   folded: ${Math.round(100 * (1 - s.cloth.coverage))}% smaller footprint` : '';
   const hold = (h) => s.holding?.[h] ? ' (holding cloth)' : '';
+  const g = s.game;
+  const gameLine = !g ? '' : g.done
+    ? `FOLDED in ${g.time.toFixed(0)} s` + (g.best !== null ? `   best ${g.best.toFixed(0)} s` : '') + '   (X = new game)'
+    : `step ${g.step + 1}/${g.steps}: ${g.goal}   ${g.running ? g.time.toFixed(0) + ' s' : '(grip to start)'}` +
+      (g.best !== null ? `   best ${g.best.toFixed(0)} s` : '');
   statusEl.textContent =
+    (gameLine ? gameLine + '\n' : '') +
     `task: ${s.task_title || s.task || '-'}${cov}\n` +
     `${rec ? '● REC ' + s.rec_time.toFixed(1) + 's (' + s.frames + ' fr)' : 'idle'}\n` +
     `next episode: ${s.next_episode}   last: ${s.last_saved || '-'}\n` +
@@ -471,8 +496,20 @@ function updateHud() {
   btnRec.textContent = rec ? '■ Stop & save' : '● Record';
   btnRec.className = rec ? 'rec' : '';
   const c = hudCanvas.getContext('2d');
-  c.clearRect(0, 0, 512, 256);
-  c.fillStyle = 'rgba(15,17,22,0.85)'; c.beginPath(); c.roundRect(0, 0, 512, 256, 24); c.fill();
+  c.clearRect(0, 0, 512, 384);
+  c.fillStyle = 'rgba(15,17,22,0.85)'; c.beginPath(); c.roundRect(0, 0, 512, 384, 24); c.fill();
+  if (g) {                     // the folding game: step, goal, clock
+    const pct = Math.round(100 * (s.cloth?.coverage ?? 1));
+    c.fillStyle = g.done ? '#5ee07a' : '#ffd24a';
+    c.font = 'bold 34px system-ui, sans-serif';
+    c.fillText(g.done ? `FOLDED  ${g.time.toFixed(0)} s` : `STEP ${g.step + 1}/${g.steps}   ${g.running ? g.time.toFixed(0) + ' s' : ''}`, 24, 300);
+    c.fillStyle = '#eee'; c.font = '24px system-ui, sans-serif';
+    c.fillText(g.done ? (g.best !== null ? `best ${g.best.toFixed(0)} s  -  X for a new game` : '') : g.goal.slice(0, 40), 24, 336);
+    if (!g.done) {
+      c.fillStyle = '#9ab';
+      c.fillText(`footprint ${pct}% -> ${Math.round(100 * g.target)}%` + (g.best !== null ? `   best ${g.best.toFixed(0)} s` : ''), 24, 368);
+    }
+  }
   c.fillStyle = rec ? '#ff4040' : '#8a8f98';
   c.font = 'bold 54px system-ui, sans-serif';
   c.fillText(rec ? `● REC ${s.rec_time.toFixed(1)}s` : '○ idle', 24, 72);
@@ -595,8 +632,25 @@ function handleXRInput() {
 }
 
 // -------------------------------------------------------------------- loop
+const bodyPose = { prev: null, cur: null, t: 0, interval: 11 };
+const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion();
+function smoothBodies() {
+  const { prev, cur } = bodyPose;
+  if (!cur || cur.length !== 7 * bodyObjs.length) return;
+  // one packet interval behind the newest pose: always between two real poses
+  const a = Math.min(1, (performance.now() - bodyPose.t) / bodyPose.interval);
+  for (let i = 0, k = 0; i < bodyObjs.length; i++, k += 7) {
+    const o = bodyObjs[i];
+    o.position.set(prev[k] + a * (cur[k] - prev[k]), prev[k + 1] + a * (cur[k + 1] - prev[k + 1]),
+      prev[k + 2] + a * (cur[k + 2] - prev[k + 2]));
+    _qa.set(prev[k + 4], prev[k + 5], prev[k + 6], prev[k + 3]);
+    _qb.set(cur[k + 4], cur[k + 5], cur[k + 6], cur[k + 3]);
+    o.quaternion.slerpQuaternions(_qa, _qb, a);
+  }
+}
 renderer.setAnimationLoop(() => {
   handleXRInput();
+  smoothBodies();
   for (const c of cloths) updateCloth(c);
   if (!renderer.xr.isPresenting) updateMirrorCamera();
   renderer.render(scene, camera);

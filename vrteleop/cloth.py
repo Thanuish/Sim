@@ -18,6 +18,7 @@ across the garment (v<0 = the garment's right leg as it lies on the table).
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from functools import lru_cache
 from io import BytesIO
@@ -256,6 +257,72 @@ def jeans_garment(g: GarmentSpec):
     return {"uv": uv_all[order], "z": z[order], "layer": layer[order], "faces": new[all_faces],
             "threads": new[both(threads)], "diagonals": new[both(diags)], "twins": new[twins],
             "tc": tc, "face_tc": face_tc}
+
+
+# ------------------------------------------------- cloth simulated outside MuJoCo
+def fine_garment(g: GarmentSpec, spacing: float, thickness: float):
+    """The garment at the GPU engine's resolution: (garment, jeans_garment dict, collision
+    thickness [m]). The two panels start a little more than one thickness apart (seams
+    halfway) and settle into contact."""
+    thick = thickness * spacing
+    g = dataclasses.replace(g, spacing=spacing, layer_gap=1.2 * thick)
+    return g, jeans_garment(g), thick
+
+
+def place_flat(J: dict, pos, yaw: float, table_z: float, lift: float) -> np.ndarray:
+    """World positions of a jeans_garment lying flat: waistband centre at pos, legs along yaw."""
+    c, s = np.cos(yaw), np.sin(yaw)
+    R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    return (np.c_[J["uv"], J["z"]] @ R.T + [pos[0], pos[1], table_z + lift]).astype(np.float32)
+
+
+class ClothRenderMesh:
+    """A render-only mesh geom in the MuJoCo model that shows a cloth simulated elsewhere (the
+    GPU engine): MuJoCo renders (camera screens, recorded images, videos) draw it after its
+    vertices are uploaded with update()."""
+    NAME = "jeans_render"
+
+    @classmethod
+    def add(cls, spec: mujoco.MjSpec, X: np.ndarray, J: dict, material: str):
+        mesh = spec.add_mesh()
+        mesh.name = cls.NAME
+        mesh.uservert = np.asarray(X, float).ravel().tolist()
+        mesh.userface = J["faces"].ravel().tolist()
+        mesh.usertexcoord = J["tc"].ravel().tolist()
+        mesh.userfacetexcoord = J["face_tc"].ravel().tolist()
+        mesh.inertia = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL   # a thin sheet, no volume
+        gm = spec.worldbody.add_geom()
+        gm.name = cls.NAME
+        gm.type = mujoco.mjtGeom.mjGEOM_MESH
+        gm.meshname = cls.NAME
+        gm.material = material
+        gm.contype = gm.conaffinity = 0                            # drawn only, never collides
+        gm.group = 1
+
+    def __init__(self, m: mujoco.MjModel, faces: np.ndarray):
+        self.mid = m.mesh(self.NAME).id
+        self.gid = m.geom(self.NAME).id
+        self.va, self.n = m.mesh_vertadr[self.mid], m.mesh_vertnum[self.mid]
+        self.na = m.mesh_normaladr[self.mid]
+        if m.mesh_normalnum[self.mid] != self.n:
+            raise ValueError("render mesh: MuJoCo changed the vertex layout")
+        self.faces = faces
+
+    def update(self, m: mujoco.MjModel, d: mujoco.MjData, V: np.ndarray, renderer: mujoco.Renderer):
+        """Show vertex positions V (world frame) in `renderer`."""
+        p, R = d.geom_xpos[self.gid], d.geom_xmat[self.gid].reshape(3, 3)
+        local = (np.asarray(V, np.float64) - p) @ R
+        F = self.faces
+        fn = np.cross(local[F[:, 1]] - local[F[:, 0]], local[F[:, 2]] - local[F[:, 0]])
+        # area-weighted vertex normals: the face normals summed per corner (bincount: ~10x
+        # faster than np.add.at)
+        idx = F.ravel()
+        vn = np.stack([np.bincount(idx, weights=np.repeat(fn[:, c], 3), minlength=len(local))
+                       for c in range(3)], axis=1)
+        vn /= np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
+        m.mesh_vert[self.va:self.va + self.n] = local
+        m.mesh_normal[self.na:self.na + self.n] = vn
+        mujoco.mjr_uploadMesh(m, renderer._mjr_context, self.mid)
 
 
 # ------------------------------------------------------------------ MuJoCo

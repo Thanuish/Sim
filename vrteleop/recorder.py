@@ -19,7 +19,8 @@ Layout (T = number of frames, sampled at a fixed rate in *sim* time):
     /teleop/engaged                 (T, 2)      bool
     /teleop/head_pose               (T, 7)      operator head in MuJoCo frame (nan if unknown)
     /teleop/controller_pose         (T, 2, 7)
-    /teleop/cloth_grasp             (T, 2, 12)  cloth vertices pinched by [left, right] gripper (-1 = none)
+    /teleop/cloth_grasp             (T, 2, K)   cloth vertices pinched by [left, right] gripper (-1 = none;
+                                                K = 12 with the MuJoCo cloth, 96 with the GPU cloth)
 
 Cloth episodes also store /cloth/faces (F, 3) and /cloth/rest_uv (N, 2) (the flat pattern
 in metres), and root attrs final_coverage / final_height (see cloth.fold_metrics).
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import threading
 from pathlib import Path
 
 import h5py
@@ -55,6 +57,7 @@ class EpisodeRecorder:
         self.active = False
         self.frames: dict[str, list] = {}
         self.t_start = 0.0
+        self._writers: list[threading.Thread] = []
 
     @property
     def num_frames(self) -> int:
@@ -80,14 +83,30 @@ class EpisodeRecorder:
         self.frames = {}
 
     def stop(self, timestep: float, success: bool | None = None,
-             extra_attrs: dict | None = None) -> Path | None:
+             extra_attrs: dict | None = None, on_saved=None) -> Path | None:
+        """End the episode. The file is written on a background thread (compressing a long
+        episode takes a second or more, which must not stall the simulation); `on_saved(path)`
+        runs once it is complete. Returns the path (its name is reserved right away)."""
         self.active = False
         if self.num_frames < 2:
             self.frames = {}
             return None
         idx = self.next_index()
         path = self.out_dir / f"episode_{idx:04d}.hdf5"
-        f = self.frames
+        path.touch()                          # reserve the name: the next episode gets the next one
+        frames, self.frames = self.frames, {}
+        t = threading.Thread(target=self._write, name=f"write {path.name}",
+                             args=(path, frames, self.t_start, timestep, success, extra_attrs, on_saved))
+        t.start()
+        self._writers = [w for w in self._writers if w.is_alive()] + [t]
+        return path
+
+    def wait(self):
+        """Block until every episode is on disk (call before exiting)."""
+        for w in self._writers:
+            w.join()
+
+    def _write(self, path, f, t_start, timestep, success, extra_attrs, on_saved):
         with h5py.File(path, "w") as h:
             h.attrs["task"] = self.task
             h.attrs["fps"] = self.fps
@@ -100,7 +119,7 @@ class EpisodeRecorder:
             h.attrs["model_xml"] = self.model_xml
             for k, v in (extra_attrs or {}).items():
                 h.attrs[k] = v
-            h.create_dataset("time", data=np.stack(f["time"]) - self.t_start)
+            h.create_dataset("time", data=np.stack(f["time"]) - t_start)
             obs = h.create_group("observations")
             for k in ("qpos", "qvel", "ee_pos", "ee_quat", "object_pose", "full_qpos", "full_qvel"):
                 data = np.stack(f[k]).astype(np.float32 if not k.startswith("full") else np.float64)
@@ -131,5 +150,5 @@ class EpisodeRecorder:
                 cg = h.create_group("cloth")
                 cg.create_dataset("faces", data=np.asarray(self.cloth_faces, np.int32))
                 cg.create_dataset("rest_uv", data=np.asarray(self.cloth_rest_uv, np.float32))
-        self.frames = {}
-        return path
+        if on_saved is not None:
+            on_saved(path)

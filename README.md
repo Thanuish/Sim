@@ -49,6 +49,31 @@ consistent. Closing other apps and turning off the camera screens (`--stream-cam
 (~40 % less CPU), in which folded or crumpled fabric can cut through itself and the pale inside
 shows.
 
+**GPU cloth engine** (the default of `start.bat`; `start.bat --cloth-engine mujoco` for the
+MuJoCo cloth above, which the server also falls back to if the GPU engine can't start). The
+jeans are simulated on the GPU (`vrteleop/gpu_cloth.py`, XPBD in Taichi on any Vulkan GPU, AMD
+included) at 1 cm resolution: ~9000 points instead of ~300, so folds are round and creases
+sharp. MuJoCo then only
+simulates the robots; every 1/60 s the arms' and grippers' collision shapes (the curved finger links
+as several boxes each) are handed to the cloth, which collides with them, with the table and with
+itself (with friction, so folds stay put). The pinch works as below and holds every point of every
+layer between the pads. While a gripper pinches, every point is tethered to its nearest pinched
+point (long-range attachments, Kim et al. 2012), so a lifted leg hangs at its true length
+instead of stretching like rubber and snapping back; and only an arm that pinches has friction
+on the fabric (open fingers don't squeeze it, so it slides off them). Settings: `[gpu]` in
+`config/cloth.toml`. Headless check:
+`python scripts/gpu_cloth_test.py`; with the teleop controls of both arms, including replays of
+recorded VR sessions: `python scripts/teleop_trials.py --cloth-engine gpu --human EPISODE.hdf5`.
+Not yet with this engine: `--randomize` / `--cloth-init crumpled` start flat, and a pinch doesn't
+slip. Episodes are larger (~1 MB per second).
+
+**The folding game** (jeans task). The panels show three steps, checked on the footprint of
+the jeans on the table once the fabric has settled and nothing is held: 1. lay one leg over the
+other (footprint ≤ 62 % of the flat jeans), 2. fold them in half, hems up to the waist (≤ 35 %),
+3. fold once more (≤ 22 %). The clock starts when you first grip an arm and stops at the last
+step; the best time is kept while the server runs. X (reset scene) starts a new game.
+`vrteleop/fold_game.py` has the steps and thresholds.
+
 **How grasping works.** Lower the open gripper until the fingertips are just above the fabric,
 then close it. The 2F-85 fingertips swing down about 18 mm as they close, and that motion
 pinches the fabric. The jaws only catch fabric if they close with cloth between the fingertips,
@@ -308,25 +333,51 @@ python scripts/replay.py data/episode_0000.hdf5 --mode actions --video check.mp4
 --data-dir data      output folder
 --garment NAME       jeans task: garment from the cloth settings (default: the file's `default`)
 --cloth-config FILE  jeans task: cloth settings file (default config/cloth.toml)
+--cloth-engine NAME  jeans task: cloth simulation, gpu (default) or mujoco
 --cloth-spacing M    jeans task: override the garment's simulation resolution
 --cloth-fast         jeans task: cheaper cloth collisions (folds can cut through themselves)
 --slip-force N       jeans task: override the pinch slip force
 --cloth-init crumpled  jeans task: start from a random heap
 ```
 
+## Control from Claude (MCP) and the control API
+
+The running server has a small HTTP control API, reachable from this PC only:
+`GET /api/status`, `POST /api/command {"cmd": "reset" | "record_toggle" | "save_fail" | "discard" |
+"cams_toggle"}`, `GET /api/cloth`, and `POST /api/reload {"garment": "shorts", "overrides": {...}}`,
+which rebuilds the scene with another garment (re-reading `config/cloth.toml`) without restarting;
+the headset picks up the new scene by itself.
+
+`vrteleop/mcp_server.py` is an MCP server on top of it, so Claude (or any MCP client) can run and
+tune the simulator: `sim_status`, `sim_command`, `load_garment`, `list_garments`,
+`cloth_settings`, `set_cloth_value` (edits `config/cloth.toml` keeping its comments, validates
+the file before saving, `apply=true` reloads the running scene), `run_cloth_test` (the physics
+benchmark), `list_episodes`, `episode_info`. It is a separate process and only talks to the
+control API, so the simulator doesn't depend on it. Claude Code picks it up from `.mcp.json` in
+the repo (approve the `teleop-sim` server once); on macOS/Linux change its `command` to
+`.venv/bin/python`. Settings and tests work without the simulator running; `sim_*` and
+`load_garment` need `start.bat` running.
+
 ## Project layout
 
 ```
 vrteleop/
+  server.py     orchestrates the parts: real-time sim loop, recording, headset streaming,
+                control API
+  arms.py       the two teleoperated arms: clutch mapping + IK -> joint / gripper commands
+  cloth_engine.py  ClothEngine interface (reset, update, step, verts, held, metrics) with the
+                MuJoCo and the GPU engines; the server only talks to this interface
+  fold_game.py  the folding game: steps, thresholds, clock
   scene.py      MjSpec scene: room, table, 2x UR5e + 2F-85, cameras, home poses, tasks
   cloth.py      jeans pattern, flex cloth, pinch grasp model, fold metrics, denim textures
   cloth_config.py  loads garments and cloth settings from config/cloth.toml
+  gpu_cloth.py  XPBD cloth on the GPU (Taichi/Vulkan), ~1.2 cm resolution
+  mcp_server.py MCP server for Claude / MCP clients (talks to the control API)
   textures.py   procedural floor / table textures
   ik.py         damped-least-squares differential IK (runs on a kinematic shadow MjData)
   teleop.py     clutch-based controller → EE target mapping, workspace limits
   recorder.py   HDF5 episode writer
   webscene.py   exports MuJoCo visual geometry (meshes deduplicated) to the web client
-  server.py     aiohttp HTTPS + WebSocket server and the real-time sim loop
   certs.py      self-signed certificate generation
   web/          WebXR client (three.js r170 vendored, works offline)
 scripts/
@@ -334,6 +385,9 @@ scripts/
   fake_client.py  headset-free end-to-end test
   cloth_bench.py  headless cloth physics benchmark (stretch, penetration, grasp release, cost)
   mesh_check.py   triangle-mesh self-intersection test (used by cloth_bench.py)
+  gpu_cloth_test.py  scripted fold of the GPU cloth (speed, self-crossings, pictures)
+  teleop_trials.py   pinch / release / poke trials through the teleop controls, any cloth
+                     engine; --human replays recorded VR sessions into it
 config/
   cloth.toml    garments (size, fabric) and cloth simulation / grasp settings
 assets/         MuJoCo Menagerie models (UR5e, Robotiq 2F-85; see their LICENSE files)

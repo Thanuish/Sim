@@ -1,4 +1,4 @@
-"""Cloth settings from a TOML file (config/cloth.toml by default).
+﻿"""Cloth settings from a TOML file (config/cloth.toml by default).
 
 The file has one table per garment (its size and fabric: every field of cloth.GarmentSpec), plus
 the simulation and grasp settings. A garment can inherit another one and change a few values.
@@ -23,9 +23,29 @@ DEFAULT_PATH = Path(__file__).resolve().parents[1] / "config" / "cloth.toml"
 
 
 @dataclasses.dataclass
+class GPUSettings:
+    """[gpu]: the GPU cloth engine (vrteleop/gpu_cloth.py, XPBD)."""
+    spacing: float = 0.010             # distance between points [m] (the garment's `spacing` is
+                                       # the MuJoCo engine's)
+    substeps: int = 20                 # solver substeps per 1/60 s frame
+    self_collision_every: int = 2      # self-collision on every n-th substep (the costliest part)
+    fps: int = 60
+    thickness: float = 0.95            # self-collision distance, as a fraction of spacing
+    stretch_compliance: float = 1e-8   # threads (inverse stiffness; 0 = rigid)
+    shear_compliance: float = 2e-5     # bias diagonals
+    bend_compliance: float = 2e-3      # across every fold line (larger = softer folds)
+    cloth_friction: float = 0.5        # Coulomb friction coefficient, fabric on fabric
+    table_friction: float = 0.4        # ... fabric on the table
+    gripper_friction: float = 0.3      # ... fabric on an arm while its gripper pinches (else 0)
+    air_drag: float = 0.5              # [1/s]
+    relaxation: float = 1.5            # Jacobi over-relaxation of the constraint solve
+
+
+@dataclasses.dataclass
 class ClothConfig:
     name: str
     garment: GarmentSpec
+    gpu: GPUSettings = dataclasses.field(default_factory=GPUSettings)
     # [simulation]
     timestep: float = 0.004
     solver_iterations: int = 30
@@ -43,7 +63,8 @@ class ClothConfig:
     def from_json(cls, text: str) -> "ClothConfig":
         d = json.loads(text)
         g = _coerce_fields(GarmentSpec, d.pop("garment"), "recorded garment")
-        return cls(garment=GarmentSpec(**g), **d)
+        gpu = GPUSettings(**_coerce_fields(GPUSettings, d.pop("gpu", {}), "recorded gpu"))
+        return cls(garment=GarmentSpec(**g), gpu=gpu, **d)
 
 
 SECTIONS = {"simulation": ("timestep", "solver_iterations"),
@@ -77,6 +98,9 @@ def _coerce_fields(cls, values: dict, where: str) -> dict:
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise ConfigError(f"{where}: '{k}' must be a number, got {v!r}")
             v = float(v)
+        elif isinstance(default, str):
+            if not isinstance(v, str):
+                raise ConfigError(f"{where}: '{k}' must be text, got {v!r}")
         elif isinstance(default, tuple):
             if not isinstance(v, (list, tuple)) or len(v) != len(default):
                 raise ConfigError(f"{where}: '{k}' must be a list of {len(default)} numbers, got {v!r}")
@@ -96,7 +120,7 @@ def _resolve(garments: dict, name: str, path: Path, chain=()) -> dict:
     parent = table.pop("inherits", None)
     merged = _resolve(garments, parent, path, chain + (name,)) if parent else {}
     for k, v in table.items():
-        if k in SECTIONS and isinstance(v, dict):
+        if (k in SECTIONS or k == "gpu") and isinstance(v, dict):
             merged[k] = {**merged.get(k, {}), **v}
         else:
             merged[k] = v
@@ -116,9 +140,9 @@ def load(name: str | None = None, path: str | Path | None = None,
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: {e}") from None
     for k in data:
-        if k not in ("default", "garments", *SECTIONS):
+        if k not in ("default", "garments", "gpu", *SECTIONS):
             raise ConfigError(f"{path}: unknown top-level setting '{k}'"
-                              f"{_suggest(k, ['default', 'garments', *SECTIONS])}")
+                              f"{_suggest(k, ['default', 'garments', 'gpu', *SECTIONS])}")
     garments = data.get("garments", {})
     name = name or data.get("default")
     if not name:
@@ -132,6 +156,8 @@ def load(name: str | None = None, path: str | Path | None = None,
                 raise ConfigError(f"{path}: [{section}] unknown setting '{k}'{_suggest(k, keys)}")
             settings[k] = v
     settings = _coerce_fields(ClothConfig, settings, f"{path}")
+    gpu = {**data.get("gpu", {}), **fields.pop("gpu", {})}
+    gpu = GPUSettings(**_coerce_fields(GPUSettings, gpu, f"{path} [gpu]"))
     g = _coerce_fields(GarmentSpec, fields, f"{path} [garments.{name}]")
     g.update(overrides or {})
     garment = GarmentSpec(**g)
@@ -145,7 +171,7 @@ def load(name: str | None = None, path: str | Path | None = None,
     if garment.layer_gap <= 2 * garment.sphere_r:
         raise ConfigError(f"{path} [garments.{name}]: layer_gap ({garment.layer_gap}) must be > "
                           f"2 * sphere_r ({2 * garment.sphere_r})")
-    return ClothConfig(name=name, garment=garment, **settings)
+    return ClothConfig(name=name, garment=garment, gpu=gpu, **settings)
 
 
 def names(path: str | Path | None = None) -> list[str]:

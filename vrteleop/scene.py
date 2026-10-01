@@ -89,6 +89,7 @@ class SceneInfo:
     objects: dict = field(default_factory=dict)         # rigid task objects (name -> spec tuple)
     cloth: C.ClothInfo | None = None
     cloth_config: CC.ClothConfig | None = None           # garment + cloth simulation settings
+    cloth_engine: str | None = None                      # "mujoco" (flex in this model) or "gpu"
     grasp_eq: dict = field(default_factory=dict)        # side -> [eq ids] (cloth pinch)
     web_textures: dict = field(default_factory=dict)    # extra textures for the web client
     arm_qpos_adr: dict = field(default_factory=dict)   # side -> (6,) qpos indices
@@ -232,13 +233,17 @@ def _add_blocks(spec: mujoco.MjSpec):
         g.condim = 4
 
 
-def _add_jeans(spec: mujoco.MjSpec, cfg: CC.ClothConfig):
-    g = cfg.garment
+def _add_denim_material(spec: mujoco.MjSpec, g: C.GarmentSpec):
     front, back = C.denim_textures(g)
     # texture atlas: front panel on the left half, back panel on the right half
     atlas = np.concatenate([T.decode_png(front), T.decode_png(back)], axis=1)
     T.add_texture(spec, "denim_atlas", atlas)
     T.add_material(spec, "denim", "denim_atlas", specular=0.08, shininess=0.1, roughness=0.95)
+
+
+def _add_jeans(spec: mujoco.MjSpec, cfg: CC.ClothConfig):
+    g = cfg.garment
+    _add_denim_material(spec, g)
     x, y = JEANS_POS
     info = C.add_garment(spec, "jeans", [x, y, TABLE_Z + g.sphere_r + 0.0003], JEANS_YAW, g,
                          material="denim")
@@ -259,9 +264,11 @@ def _add_jeans(spec: mujoco.MjSpec, cfg: CC.ClothConfig):
     return info, {}
 
 
-def build_spec(task: str = DEFAULT_TASK, cloth: CC.ClothConfig | None = None):
+def build_spec(task: str = DEFAULT_TASK, cloth: CC.ClothConfig | None = None,
+               cloth_engine: str = "mujoco"):
     """Returns (spec, cloth_info or None, extra web textures). `cloth`: garment and cloth
-    simulation settings (default: config/cloth.toml, see cloth_config)."""
+    simulation settings (default: config/cloth.toml, see cloth_config). With a cloth engine other
+    than "mujoco" the jeans are simulated outside the model: it only gets their material."""
     if task not in TASKS:
         raise ValueError(f"unknown task '{task}', choose from {list(TASKS)}")
     spec = mujoco.MjSpec()
@@ -357,8 +364,15 @@ def build_spec(task: str = DEFAULT_TASK, cloth: CC.ClothConfig | None = None):
     cloth_info, web_tex = None, {}
     if task == "blocks":
         _add_blocks(spec)
-    elif task == "jeans":
+    elif task == "jeans" and cloth_engine == "mujoco":
         cloth_info, web_tex = _add_jeans(spec, cloth)
+    elif task == "jeans":
+        # simulated outside the model: only its material, and a render-only mesh the engine
+        # updates before MuJoCo renders (camera screens, recorded images, videos)
+        _add_denim_material(spec, cloth.garment)
+        _, J, thick = C.fine_garment(cloth.garment, cloth.gpu.spacing, cloth.gpu.thickness)
+        C.ClothRenderMesh.add(spec, C.place_flat(J, JEANS_POS, JEANS_YAW, TABLE_Z, 0.5 * thick),
+                              J, "denim")
     return spec, cloth_info, web_tex
 
 
@@ -380,13 +394,14 @@ def _look_quat(pos, target, up=(0, 0, 1)):
     return q
 
 
-def build_scene(task: str = DEFAULT_TASK, cloth: CC.ClothConfig | None = None) -> SceneInfo:
+def build_scene(task: str = DEFAULT_TASK, cloth: CC.ClothConfig | None = None,
+                cloth_engine: str = "mujoco") -> SceneInfo:
     if task == "jeans":
         cloth = cloth or CC.load()
-    spec, cloth_info, web_tex = build_spec(task, cloth)
+    spec, cloth_info, web_tex = build_spec(task, cloth, cloth_engine)
     model = spec.compile()
     info = SceneInfo(model=model, xml=spec.to_xml(), task=task, web_textures=web_tex,
-                     cloth_config=cloth)
+                     cloth_config=cloth, cloth_engine=cloth_engine if task == "jeans" else None)
     for side in SIDES:
         jids = [model.joint(f"{side}_{j}").id for j in ARM_JOINTS]
         info.arm_qpos_adr[side] = np.array([model.jnt_qposadr[j] for j in jids])

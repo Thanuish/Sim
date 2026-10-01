@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "teleop-sim": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": ["-m", "vrteleop.mcp_server"],
+      "env": { "SIM_URL": "http://localhost:8080" }
+    }
+  }
+}

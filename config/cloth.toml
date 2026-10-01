@@ -23,6 +23,29 @@ release_gap = 0.004          # the pinch lets go once the pads are this much fur
                              # they closed [m]: a short flick of the stick opens it
 pad_friction = 1.0           # silicone finger pads on fabric (0.6 slippery .. 1.2 grippy)
 
+[gpu]                        # the GPU cloth engine (start.bat --cloth-engine gpu; XPBD on any Vulkan
+                             # GPU). A garment can override: [garments.NAME.gpu]. The garment's size,
+                             # mass and friction are shared; these replace its MuJoCo-only settings.
+spacing = 0.010              # distance between simulated points [m] (~9000 for the jeans). 0.012 =
+                             # faster but folded stacks are thicker; the GPU cost grows with the points
+substeps = 20                # solver steps per 1/60 s frame: more = stiffer threads and safer contacts
+self_collision_every = 2     # fabric-on-fabric collision on every n-th substep (1 = every one: ~40 %
+                             # slower; a point moves at most 0.4 thickness per substep)
+thickness = 0.95             # self-collision distance as a fraction of spacing (9.5 mm): how thick
+                             # a layer is in a fold. Below ~0.9 the fabric slips through itself
+                             # (0.75 -> hundreds of crossings in a fold); 1.0 = puffier, springier folds
+stretch_compliance = 1e-8    # threads: stretch softness (0 = inextensible; 1e-6 visibly stretchy)
+shear_compliance = 2e-5      # bias diagonals: shear softness (denim shears easily)
+bend_compliance = 2e-3       # folds: bending softness (smaller = stiffer fabric, rounder folds)
+cloth_friction = 0.5         # friction coefficient, fabric on fabric: keeps folds in place (denim
+                             # on denim ~0.5; 0 = layers slide apart and folds fall open)
+table_friction = 0.4         # ... fabric on the laminate table (0 = ice)
+gripper_friction = 0.3       # ... fabric on an arm while its gripper pinches (around the pinch).
+                             # An arm whose gripper holds nothing doesn't squeeze the fabric, so it
+                             # has no friction: fabric slides off open fingers instead of hanging on
+air_drag = 0.5               # [1/s]: dropped fabric floats down a little
+relaxation = 1.5             # solver over-relaxation (1 .. 1.8; leave as is)
+
 
 [garments.jeans]             # a pair of adult 12 oz denim jeans, W32 L32 regular fit
 # ---- size of the garment lying flat ------------------------------------------------------------

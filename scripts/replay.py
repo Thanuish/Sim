@@ -71,8 +71,18 @@ def main():
         else:                                         # older episodes: default garment, recorded spacing
             sp = h.attrs.get("cloth_spacing")
             cloth = CC.load(overrides={"spacing": float(sp)} if sp else None)
-    sc = S.build_scene(task, cloth)
+    engine = h.attrs.get("cloth_engine", "mujoco")
+    engine = engine.decode() if isinstance(engine, bytes) else engine
+    # a cloth simulated outside MuJoCo (the GPU engine) replays from its recorded vertices, drawn
+    # through the scene's render-only mesh; the robots replay from the recorded states
+    sc = S.build_scene(task, cloth, engine if task == "jeans" else "mujoco")
     m, d = sc.model, mujoco.MjData(sc.model)
+    render_mesh = None
+    if task == "jeans" and engine != "mujoco":
+        render_mesh = C.ClothRenderMesh(m, h["cloth/faces"][:])
+        cloth_verts = h["observations/cloth_verts"]
+        if a.mode == "actions":
+            sys.exit(f"--mode actions needs the MuJoCo cloth; this episode used the '{engine}' engine")
     grasp = {}
     if sc.cloth is not None:
         grasp = {s: C.PinchGrasp(m, sc.cloth, s, sc.grasp_eq[s], slip_force=cloth.slip_force,
@@ -140,6 +150,8 @@ def main():
                 advance(i)
                 if operator:
                     place_operator(i)
+                if render_mesh is not None:
+                    render_mesh.update(m, d, cloth_verts[i], r)
                 r.update_scene(d, camera=camera)
                 w.append_data(r.render())
         print(f"wrote {a.video} ({T} frames)")
@@ -149,6 +161,9 @@ def main():
         return
 
     from mujoco import viewer as mjviewer
+    if render_mesh is not None:
+        print("note: the interactive viewer shows the GPU-simulated jeans in their start pose; "
+              "use --video to see them move")
     with mjviewer.launch_passive(m, d) as v:
         i = 0
         while v.is_running():
